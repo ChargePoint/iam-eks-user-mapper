@@ -2,14 +2,16 @@ package main
 
 import (
 	"flag"
+	"io/ioutil"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/kataras/golog"
 	"gopkg.in/yaml.v2"
-	"strings"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -17,9 +19,22 @@ import (
 )
 
 func main() {
-	iamGroup := flag.String("aws-iam-group","", "--aws-iam-group=devs")
-	k8sCap := flag.String("k8s-cap","", "--k8s-cap=system:masters,aggregate-to-admin")
+	iamGroupMappings := flag.String("aws-iam-group-mappings", "", "--aws-iam-group-mappings=mappings.json")
+	iamGroup := flag.String("aws-iam-group", "", "--aws-iam-group=devs")
+	k8sCap := flag.String("k8s-cap", "", "--k8s-cap=system:masters,aggregate-to-admin")
 	flag.Parse()
+
+	allGroupMappings := groupMappings{}
+	if *iamGroupMappings != "" {
+		var groupMappingFile []byte
+		var err error
+		if groupMappingFile, err = ioutil.ReadFile(*iamGroupMappings); err != nil {
+			panic(err.Error())
+		}
+		if err = yaml.Unmarshal(groupMappingFile, &allGroupMappings); err != nil {
+			panic(err.Error())
+		}
+	}
 
 	//enumerate the k8s roles
 	roleArr := strings.Split(*k8sCap, ",")
@@ -33,20 +48,37 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
+	if *iamGroup != "" && roleArr != nil && roleArr[0] != "" {
+		allGroupMappings.Mappings = append(
+			allGroupMappings.Mappings,
+			groupMapping{
+				IAMGroup: *iamGroup,
+				K8sCaps:  roleArr,
+			},
+		)
+	}
 	for {
-		users := getAwsIamGroup(*iamGroup)
+		currentUsers := make(map[string]bool)
+		var newConfig []MapUserConfig
 		cf, err := clientset.CoreV1().ConfigMaps("kube-system").Get("aws-auth", metav1.GetOptions{})
 		if err != nil {
 			panic(err.Error())
 		}
-		var newConfig []MapUserConfig
-
-		for _, user := range users.Users {
-			newConfig = append(newConfig, MapUserConfig{
-				UserArn: *user.Arn,
-				Username: *user.UserName,
-				Groups: roleArr,
-			})
+		for _, mapping := range allGroupMappings.Mappings {
+			users := getAwsIamGroup(mapping.IAMGroup)
+			for _, user := range users.Users {
+				var found bool
+				if found, _ = currentUsers[*user.Arn]; found {
+					continue
+				} else {
+					currentUsers[*user.Arn] = true
+				}
+				newConfig = append(newConfig, MapUserConfig{
+					UserArn:  *user.Arn,
+					Username: *user.UserName,
+					Groups:   mapping.K8sCaps,
+				})
+			}
 		}
 		roleStr, err := yaml.Marshal(newConfig)
 		if err != nil {
@@ -71,7 +103,7 @@ func getAwsIamGroup(groupName string) *iam.GetGroupOutput {
 	group, err := iamClient.GetGroup(&iam.GetGroupInput{
 		GroupName: aws.String(groupName),
 	})
-	if err != nil{
+	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
 			switch aerr.Code() {
 			case iam.ErrCodeNoSuchEntityException:
